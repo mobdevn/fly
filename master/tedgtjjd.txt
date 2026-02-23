@@ -1,0 +1,213 @@
+package com.barclays.mobilebanking.kyc.identitycheck
+
+import androidx.compose.runtime.Immutable
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.barclays.mobilebanking.kyc.model.KycAction
+import com.barclays.mobilebanking.kyc.model.KycDocumentItem
+import com.barclays.mobilebanking.kyc.model.KycItemDescription
+import com.barclays.mobilebanking.kyc.model.KycSectionItem
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+
+/**
+ * Sealed interface for screen states - Single source of truth
+ */
+sealed interface IdentityCheckScreenState {
+    data object Loading : IdentityCheckScreenState
+    data class Success(val data: IdentityCheckUiModel) : IdentityCheckScreenState
+    data class Error(val message: String) : IdentityCheckScreenState
+}
+
+/**
+ * Immutable UI model containing all display data
+ */
+@Immutable
+data class IdentityCheckUiModel(
+    val pageTitle: String = "",
+    val navigationTitle: String = "",
+    val description: KycItemDescription = KycItemDescription(),
+    val image: String = "",
+    val notificationAlert: String = "",
+    val buttonText: String = "",
+    val linkText: String = "",
+    val drawerTitle: String = "",
+    val drawerItems: List<KycSectionItem> = emptyList(),
+    val actions: List<KycAction> = emptyList()
+)
+
+/**
+ * Repository interface for data operations - Dependency Inversion Principle
+ */
+interface IdentityCheckRepository {
+    suspend fun fetchIdentityCheckData(journeyType: String): Result<KycDocumentItem>
+}
+
+/**
+ * Navigator interface for navigation operations - Dependency Inversion Principle
+ */
+interface IdentityCheckNavigator {
+    fun launchAemScreen(screenId: String)
+    fun onBackPressed()
+}
+
+/**
+ * Analytics interface - Dependency Inversion Principle
+ */
+interface IdentityCheckAnalytics {
+    fun logScreenLoad(label: String)
+    fun logButtonClick(label: String)
+    fun logLinkClick(label: String)
+}
+
+/**
+ * Mapper interface for transforming data - Single Responsibility Principle
+ */
+interface IdentityCheckMapper {
+    fun mapToUiModel(documentItem: KycDocumentItem): IdentityCheckUiModel
+}
+
+/**
+ * Default implementation of mapper
+ */
+class DefaultIdentityCheckMapper : IdentityCheckMapper {
+
+    override fun mapToUiModel(documentItem: KycDocumentItem): IdentityCheckUiModel =
+        with(documentItem) {
+            IdentityCheckUiModel(
+                pageTitle = pageTitle.orEmpty(),
+                navigationTitle = extractNavigationTitle(),
+                description = extractDescription(),
+                image = extractImage(),
+                notificationAlert = extractNotificationAlert(),
+                buttonText = actions.firstOrNull()?.label.orEmpty(),
+                linkText = actions.lastOrNull()?.label.orEmpty(),
+                drawerTitle = sections.lastOrNull()?.title.orEmpty(),
+                drawerItems = sections.lastOrNull()?.items.orEmpty(),
+                actions = actions
+            )
+        }
+
+    private fun KycDocumentItem.extractNavigationTitle(): String =
+        sections.firstOrNull()
+            ?.items
+            ?.firstOrNull()
+            ?.title
+            .orEmpty()
+
+    private fun KycDocumentItem.extractDescription(): KycItemDescription =
+        sections.firstOrNull()
+            ?.items
+            ?.firstOrNull()
+            ?.description
+            ?: KycItemDescription()
+
+    private fun KycDocumentItem.extractImage(): String =
+        sections.firstOrNull()
+            ?.items
+            ?.firstOrNull()
+            ?.image
+            ?.source
+            ?.path
+            .orEmpty()
+
+    private fun KycDocumentItem.extractNotificationAlert(): String =
+        sections.firstOrNull()
+            ?.items
+            ?.lastOrNull()
+            ?.description
+            ?.json
+            ?.firstOrNull()
+            ?.content
+            ?.firstOrNull()
+            ?.value
+            .orEmpty()
+}
+
+/**
+ * ViewModel following SOLID principles:
+ * - Single Responsibility: Only manages UI state
+ * - Open/Closed: Extensible via interfaces
+ * - Liskov Substitution: Dependencies are interfaces
+ * - Interface Segregation: Small focused interfaces
+ * - Dependency Inversion: Depends on abstractions
+ */
+class IdentityCheckViewModel(
+    private val repository: IdentityCheckRepository,
+    private val navigator: IdentityCheckNavigator,
+    private val analytics: IdentityCheckAnalytics,
+    private val mapper: IdentityCheckMapper = DefaultIdentityCheckMapper()
+) : ViewModel() {
+
+    private val _screenState = MutableStateFlow<IdentityCheckScreenState>(IdentityCheckScreenState.Loading)
+    val screenState: StateFlow<IdentityCheckScreenState> = _screenState.asStateFlow()
+
+    private var isDataLoaded = false
+    private var currentUiModel: IdentityCheckUiModel? = null
+
+    fun loadData(journeyType: String?) {
+        journeyType?.takeUnless { isDataLoaded }?.let { type ->
+            viewModelScope.launch {
+                repository.fetchIdentityCheckData(type)
+                    .fold(
+                        onSuccess = ::handleSuccess,
+                        onFailure = ::handleError
+                    )
+            }
+        }
+    }
+
+    fun onScreenLoad() {
+        analytics.logScreenLoad(SCREEN_NAME)
+    }
+
+    fun onContinueButtonClicked() {
+        currentUiModel?.actions?.firstOrNull()?.let { action ->
+            action.label?.let(analytics::logButtonClick)
+            navigateToNext(action)
+        }
+    }
+
+    fun onLinkClicked() {
+        currentUiModel?.actions
+            ?.lastOrNull()
+            ?.label
+            ?.let(analytics::logLinkClick)
+    }
+
+    fun onBackPressed() {
+        navigator.onBackPressed()
+    }
+
+    private fun handleSuccess(documentItem: KycDocumentItem) {
+        mapper.mapToUiModel(documentItem).also { uiModel ->
+            currentUiModel = uiModel
+            _screenState.update { IdentityCheckScreenState.Success(uiModel) }
+            isDataLoaded = true
+        }
+    }
+
+    private fun handleError(error: Throwable) {
+        _screenState.update {
+            IdentityCheckScreenState.Error(error.message ?: DEFAULT_ERROR_MESSAGE)
+        }
+    }
+
+    private fun navigateToNext(action: KycAction) {
+        action.takeIf { it.details?.launchValue == NAVIGATE_ACTION }
+            ?.details
+            ?.params
+            ?.firstOrNull()
+            ?.value
+            ?.let(navigator::launchAemScreen)
+    }
+
+    private companion object {
+        const val SCREEN_NAME = "IdentityCheck"
+        const val NAVIGATE_ACTION = "navigate"
+        const val DEFAULT_ERROR_MESSAGE = "Sorry, something went wrong. Please try again later."
+    }
+}
